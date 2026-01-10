@@ -1,0 +1,351 @@
+"""
+DISCLAIMER:
+This code is provided for educational and research purposes only.
+It does not constitute financial advice, investment advice,
+trading advice, or a recommendation to buy or sell any security.
+
+Agora Lycos Trading Lab makes no guarantees regarding accuracy,
+performance, or profitability. Use at your own risk.
+Past performance is not indicative of future results.
+
+Agora Lycos Trading Lab
+Entropy EOD Scanner + Bucket System (automatic)
+
+What it does (EOD, daily data):
+1) Computes an entropy-based "volatility regime" gate (magnitude, not direction).
+2) Computes TWO directional buy filters:
+   - Pullback (trend + pullback)
+   - Breakout (trend + breakout)
+3) Automatically classifies each symbol into buckets:
+   - OVERLAP: Pullback + Breakout (highest conviction)
+   - PULLBACK_ONLY
+   - BREAKOUT_ONLY
+   - NO_BUY (may still be a VOL REGIME signal)
+
+Run:
+  python entropy_bucket_scanner.py
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# -----------------------------
+# Indicators
+# -----------------------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+
+    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def add_direction_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    c = df["Close"].astype(float)
+    v = df["Volume"].astype(float)
+
+    df["sma20"] = c.rolling(20).mean()
+    df["sma50"] = c.rolling(50).mean()
+    df["sma200"] = c.rolling(200).mean()
+    df["rsi14"] = rsi(c, 14)
+
+    # Prior 20-day high (exclude today)
+    df["prior_high20"] = df["High"].shift(1).rolling(20).max()
+    df["vol20"] = v.rolling(20).mean()
+    return df
+
+
+# -----------------------------
+# Entropy (daily proxy)
+# -----------------------------
+def build_states(df: pd.DataFrame) -> pd.Series:
+    close = df["Close"].astype(float)
+    vol = df["Volume"].astype(float)
+
+    ret = close.pct_change()
+
+    # deadband for "0" sign
+    eps = 0.0005  # 5 bps
+    sign = np.where(ret > eps, 1, np.where(ret < -eps, -1, 0))
+    sign = pd.Series(sign, index=df.index).astype(int)
+
+    # rolling volume quintile (last element of qcut result in the window)
+    vol_q = (
+        vol.rolling(120, min_periods=30)
+        .apply(
+            lambda x: (
+                pd.qcut(x, 5, labels=False, duplicates="drop").iloc[-1] + 1
+                if x.nunique() > 1 else 3
+            ),
+            raw=False
+        )
+    )
+    vol_q = pd.Series(vol_q, index=df.index).astype(float).fillna(3).astype(int)
+
+    # map (sign, quintile) -> state id 0..14
+    sign_map = {-1: 0, 0: 1, 1: 2}
+    state = (sign.map(sign_map) * 5 + (vol_q - 1)).astype(int)
+    state.name = "state"
+    return state
+
+
+def transition_entropy(states: np.ndarray, K: int = 15) -> float:
+    """
+    Normalized stationary-weighted Markov transition entropy.
+    """
+    counts = np.zeros((K, K), dtype=float)
+    for a, b in zip(states[:-1], states[1:]):
+        if 0 <= a < K and 0 <= b < K:
+            counts[a, b] += 1.0
+
+    P = np.zeros_like(counts)
+    for i in range(K):
+        row_sum = counts[i].sum()
+        P[i] = (1.0 / K) if row_sum == 0 else (counts[i] / row_sum)
+
+    # Stationary distribution (power iteration)
+    pi = np.ones(K) / K
+    for _ in range(250):
+        pi_next = pi @ P
+        if np.max(np.abs(pi_next - pi)) < 1e-12:
+            break
+        pi = pi_next
+    pi = pi / pi.sum()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logP = np.where(P > 0, np.log(P), 0.0)
+    row_H = -(P * logP).sum(axis=1)
+
+    H = float((pi * row_H).sum())
+    return H / np.log(K)
+
+
+def compute_daily_entropy(df: pd.DataFrame, window_days: int = 120) -> pd.Series:
+    state = build_states(df)
+    ent = np.full(len(df), np.nan, dtype=float)
+
+    s = state.to_numpy()
+    for t in range(window_days, len(df)):
+        ent[t] = transition_entropy(s[t - window_days:t], K=15)
+
+    return pd.Series(ent, index=df.index, name="entropy")
+
+
+def download_ohlcv(symbol: str, start: str) -> pd.DataFrame:
+    df = yf.download(symbol, start=start, auto_adjust=False, progress=False)
+
+    # yfinance can return MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(symbol, axis=1, level=1).copy()
+
+    return df.dropna()
+
+
+# -----------------------------
+# Scoring + bucket classification
+# -----------------------------
+def score_symbol(
+    symbol: str,
+    start: str = "2015-01-01",
+    window_days: int = 120,
+    q: float = 0.05,
+    min_history_days: int = 500
+):
+    df = download_ohlcv(symbol, start=start)
+
+    # Target for "lift" estimation
+    df["ret"] = df["Close"].pct_change()
+    df["next_abs_ret"] = df["ret"].shift(-1).abs()
+
+    # Direction features
+    df = add_direction_features(df)
+
+    # Entropy
+    df["entropy"] = compute_daily_entropy(df, window_days=window_days)
+
+    valid = df.dropna(subset=["entropy", "next_abs_ret"])
+    if len(valid) < max(min_history_days, window_days + 60):
+        return None
+
+    entropy_thresh = float(valid["entropy"].quantile(q))
+    low_entropy_mask = valid["entropy"] < entropy_thresh
+
+    base = float(valid["next_abs_ret"].mean())
+    low = float(valid.loc[low_entropy_mask, "next_abs_ret"].mean())
+    lift_ratio = (low / base) if base > 0 else np.nan
+
+    # Latest row with all features required
+    latest = df.dropna(subset=["entropy", "sma200", "sma20", "rsi14", "prior_high20"]).iloc[-1]
+
+    today_entropy = float(latest["entropy"])
+    vol_regime_signal = bool(today_entropy < entropy_thresh)
+
+    # --- Directional filters ---
+    uptrend = bool(latest["Close"] > latest["sma200"])
+
+    # Pullback (safer variant): dip below SMA20 AND RSI not strong
+    pullback = bool((latest["Close"] < latest["sma20"]) and (latest["rsi14"] < 50))
+
+    # Breakout: close above prior 20-day high
+    breakout = bool(latest["Close"] > latest["prior_high20"])
+
+    buy_pullback = vol_regime_signal and uptrend and pullback
+    buy_breakout = vol_regime_signal and uptrend and breakout
+    overlap = buy_pullback and buy_breakout
+
+    if overlap:
+        bucket = "OVERLAP"
+    elif buy_pullback:
+        bucket = "PULLBACK_ONLY"
+    elif buy_breakout:
+        bucket = "BREAKOUT_ONLY"
+    else:
+        bucket = "NO_BUY"
+
+    return {
+        "symbol": symbol,
+        "last_date": str(latest.name.date()),
+
+        # entropy regime
+        "today_entropy": today_entropy,
+        "entropy_thresh": entropy_thresh,
+        "q": q,
+        "vol_regime_signal": vol_regime_signal,
+
+        # magnitude lift stats
+        "lift_ratio": lift_ratio,
+        "low_next_abs_ret": low,
+        "base_next_abs_ret": base,
+        "obs_days": int(len(valid)),
+        "low_days": int(low_entropy_mask.sum()),
+
+        # direction features
+        "uptrend": uptrend,
+        "pullback": pullback,
+        "breakout": breakout,
+
+        # buys + buckets
+        "buy_pullback": bool(buy_pullback),
+        "buy_breakout": bool(buy_breakout),
+        "overlap": bool(overlap),
+        "bucket": bucket,
+    }
+
+
+def run_entropy_bucket_scanner(
+    tickers,
+    start="2015-01-01",
+    window_days=120,
+    q=0.05,
+    min_lift_regime=1.10,  # filter for showing vol-regime signals
+    min_lift_buy=1.30,     # stricter filter for BUY buckets
+    top_n=20
+):
+    rows = []
+    for t in tickers:
+        try:
+            r = score_symbol(t, start=start, window_days=window_days, q=q)
+            if r is not None:
+                rows.append(r)
+        except Exception as e:
+            rows.append({"symbol": t, "error": str(e)})
+
+    out = pd.DataFrame(rows)
+
+    # Separate errors
+    if "error" in out.columns:
+        errors = out[out["error"].notna()].copy()
+        out = out[out["error"].isna()].copy()
+    else:
+        errors = pd.DataFrame()
+
+    if len(out) == 0:
+        print("No valid results.")
+        if len(errors):
+            print(errors[["symbol", "error"]].to_string(index=False))
+        return None
+
+    pd.set_option("display.max_columns", 80)
+    pd.set_option("display.width", 180)
+
+    # 1) Volatility regime signals today (entropy low), ranked by lift then extremeness
+    regime = out[out["vol_regime_signal"]].copy()
+    regime = regime[regime["lift_ratio"] >= min_lift_regime].copy()
+    regime = regime.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    print("\n=== TODAY'S ENTROPY (VOL REGIME) SIGNALS (ranked) ===")
+    if len(regime):
+        print(regime[[
+            "symbol", "last_date", "vol_regime_signal", "today_entropy", "entropy_thresh",
+            "lift_ratio", "low_next_abs_ret", "base_next_abs_ret", "low_days", "obs_days"
+        ]].to_string(index=False))
+    else:
+        print("No vol-regime signals today that meet min_lift_regime threshold.")
+
+    # Helper for printing bucket tables
+    def print_bucket(name: str, df: pd.DataFrame):
+        print(f"\n=== {name} ===")
+        if len(df):
+            print(df[[
+                "symbol", "last_date", "bucket",
+                "today_entropy", "entropy_thresh", "lift_ratio",
+                "uptrend", "pullback", "breakout",
+                "low_next_abs_ret", "base_next_abs_ret"
+            ]].to_string(index=False))
+        else:
+            print("None.")
+
+    # 2) BUY buckets today (strict on min_lift_buy)
+    buys = out[out["lift_ratio"] >= min_lift_buy].copy()
+
+    overlap_df = buys[(buys["bucket"] == "OVERLAP")].copy()
+    overlap_df = overlap_df.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    pullback_only_df = buys[(buys["bucket"] == "PULLBACK_ONLY")].copy()
+    pullback_only_df = pullback_only_df.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    breakout_only_df = buys[(buys["bucket"] == "BREAKOUT_ONLY")].copy()
+    breakout_only_df = breakout_only_df.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    print_bucket("BUY BUCKET: OVERLAP (highest conviction)", overlap_df)
+    print_bucket("BUY BUCKET: PULLBACK ONLY", pullback_only_df)
+    print_bucket("BUY BUCKET: BREAKOUT ONLY", breakout_only_df)
+
+    # 3) Top historical lift (regardless of today's regime)
+    hist = out.sort_values("lift_ratio", ascending=False).head(top_n)
+    print("\n=== TOP HISTORICAL LIFT (ranked) ===")
+    print(hist[[
+        "symbol", "lift_ratio", "low_next_abs_ret", "base_next_abs_ret", "low_days", "obs_days"
+    ]].to_string(index=False))
+
+    if len(errors):
+        print("\n=== ERRORS ===")
+        print(errors[["symbol", "error"]].to_string(index=False))
+
+    return out
+
+
+if __name__ == "__main__":
+    tickers = [
+        "SPY", "QQQ", "IWM", "DIA",
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+        "SMH", "SOXX", "ARKK", "TLT", "IEF", "HYG", "LQD",
+        "GLD", "SLV", "USO"
+    ]
+
+    run_entropy_bucket_scanner(
+        tickers=tickers,
+        start="2015-01-01",
+        window_days=120,
+        q=0.05,
+        min_lift_regime=1.10,
+        min_lift_buy=1.30,   # raise/lower this depending on how selective you want BUYs to be
+        top_n=20
+    )
