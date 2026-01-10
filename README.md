@@ -8,6 +8,7 @@ No representation is made regarding the accuracy, completeness, or suitability o
 ***********************
 
 Regime Sniper Stack(ALS-RSS)
+Run the files in this order:
 1. Alpha R1 Macro Indicator
 2. Entropy Regime Scanner
 3. Stock Entropy Regime Scanner
