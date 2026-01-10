@@ -1,0 +1,477 @@
+"""
+
+DISCLAIMER:
+This code is provided for educational and research purposes only.
+It does not constitute financial advice, investment advice,
+trading advice, or a recommendation to buy or sell any security.
+
+Agora Lycos Trading Lab makes no guarantees regarding accuracy,
+performance, or profitability. Use at your own risk.
+Past performance is not indicative of future results.
+
+
+
+Stock_Entropy_Regime_Scanner (SERS).py
+=====================================
+
+SERS = Stock version of ERS with:
+- Entropy-based volatility regime detection (magnitude regime)
+- BUY bucket system (OVERLAP / PULLBACK_ONLY / BREAKOUT_ONLY / NO_BUY)
+- Stock universe selection + cap/sector filters via filterstemplate.py
+- Liquidity filter (ADV20 in USD)
+- NEW: "Recent entropy" gate (default last 3 trading days):
+    - vol_regime_signal = entropy low TODAY (for reporting)
+    - entropy_signal_recent = entropy low at any point in last N days (for trading buckets)
+
+Run:
+  python Stock_Entropy_Regime_Scanner_SERS.py
+
+Required in same folder:
+- filterstemplate.py   (your file)
+- Optional CSV files depending on universe choice:
+    sp500_master.csv or sp500_companies.csv
+    nasdaq_master.csv or nasdaq_tickers.csv
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from filterstemplate import ask_universe, normalize_ticker
+
+
+# -----------------------------
+# Indicators
+# -----------------------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+
+    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def add_direction_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    c = df["Close"].astype(float)
+    v = df["Volume"].astype(float)
+
+    df["sma20"] = c.rolling(20).mean()
+    df["sma50"] = c.rolling(50).mean()
+    df["sma200"] = c.rolling(200).mean()
+    df["rsi14"] = rsi(c, 14)
+
+    # Prior 20-day high (exclude today)
+    df["prior_high20"] = df["High"].shift(1).rolling(20).max()
+
+    # Liquidity features
+    df["dollar_vol"] = (c * v).astype(float)
+    df["adv20_usd"] = df["dollar_vol"].rolling(20).mean()
+
+    return df
+
+
+# -----------------------------
+# Entropy (daily proxy)
+# -----------------------------
+def build_states(df: pd.DataFrame) -> pd.Series:
+    close = df["Close"].astype(float)
+    vol = df["Volume"].astype(float)
+
+    ret = close.pct_change()
+
+    # deadband for "0" sign
+    eps = 0.0005  # 5 bps
+    sign = np.where(ret > eps, 1, np.where(ret < -eps, -1, 0))
+    sign = pd.Series(sign, index=df.index).astype(int)
+
+    # rolling volume quintile (last element of qcut result in the window)
+    vol_q = (
+        vol.rolling(120, min_periods=30)
+        .apply(
+            lambda x: (
+                pd.qcut(x, 5, labels=False, duplicates="drop").iloc[-1] + 1
+                if x.nunique() > 1 else 3
+            ),
+            raw=False,
+        )
+    )
+    vol_q = pd.Series(vol_q, index=df.index).astype(float).fillna(3).astype(int)
+
+    # map (sign, quintile) -> state id 0..14
+    sign_map = {-1: 0, 0: 1, 1: 2}
+    state = (sign.map(sign_map) * 5 + (vol_q - 1)).astype(int)
+    state.name = "state"
+    return state
+
+
+def transition_entropy(states: np.ndarray, K: int = 15) -> float:
+    """
+    Normalized stationary-weighted Markov transition entropy.
+    """
+    counts = np.zeros((K, K), dtype=float)
+    for a, b in zip(states[:-1], states[1:]):
+        if 0 <= a < K and 0 <= b < K:
+            counts[a, b] += 1.0
+
+    P = np.zeros_like(counts)
+    for i in range(K):
+        row_sum = counts[i].sum()
+        P[i] = (1.0 / K) if row_sum == 0 else (counts[i] / row_sum)
+
+    # Stationary distribution (power iteration)
+    pi = np.ones(K) / K
+    for _ in range(250):
+        pi_next = pi @ P
+        if np.max(np.abs(pi_next - pi)) < 1e-12:
+            break
+        pi = pi_next
+    pi = pi / pi.sum()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logP = np.where(P > 0, np.log(P), 0.0)
+    row_H = -(P * logP).sum(axis=1)
+
+    H = float((pi * row_H).sum())
+    return H / np.log(K)
+
+
+def compute_daily_entropy(df: pd.DataFrame, window_days: int = 120) -> pd.Series:
+    state = build_states(df)
+    ent = np.full(len(df), np.nan, dtype=float)
+
+    s = state.to_numpy()
+    for t in range(window_days, len(df)):
+        ent[t] = transition_entropy(s[t - window_days : t], K=15)
+
+    return pd.Series(ent, index=df.index, name="entropy")
+
+
+# -----------------------------
+# Data download
+# -----------------------------
+def download_ohlcv(symbol: str, start: str) -> pd.DataFrame:
+    """
+    yfinance can return MultiIndex columns (field, ticker). Flatten if needed.
+    """
+    df = yf.download(symbol, start=start, auto_adjust=False, progress=False)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(symbol, axis=1, level=1).copy()
+
+    return df.dropna()
+
+
+# -----------------------------
+# Scoring + bucket classification
+# -----------------------------
+def score_symbol(
+    symbol: str,
+    start: str,
+    window_days: int,
+    q: float,
+    min_history_days: int,
+    min_adv20_usd: float,
+    recent_days: int = 3,
+) -> Optional[dict]:
+    df = download_ohlcv(symbol, start=start)
+    if df.empty or len(df) < max(min_history_days, window_days + 80):
+        return None
+
+    # Targets for lift estimation
+    df["ret"] = df["Close"].pct_change()
+    df["next_abs_ret"] = df["ret"].shift(-1).abs()
+
+    # Features
+    df = add_direction_features(df)
+
+    # Liquidity filter uses latest ADV20; skip if not enough data
+    liq_df = df.dropna(subset=["adv20_usd"])
+    if liq_df.empty:
+        return None
+    adv20 = float(liq_df.iloc[-1]["adv20_usd"])
+    if adv20 < min_adv20_usd:
+        return None
+
+    # Entropy
+    df["entropy"] = compute_daily_entropy(df, window_days=window_days)
+
+    valid = df.dropna(subset=["entropy", "next_abs_ret"])
+    if len(valid) < max(min_history_days, window_days + 60):
+        return None
+
+    entropy_thresh = float(valid["entropy"].quantile(q))
+    low_entropy_mask = valid["entropy"] < entropy_thresh
+
+    # NEW: recent entropy gate (regime active if entropy low at any point in last N days)
+    ent_tail = df["entropy"].dropna().tail(recent_days)
+    if ent_tail.empty:
+        return None
+    recent_ent = float(ent_tail.min())
+    entropy_signal_recent = bool(recent_ent < entropy_thresh)
+
+    base = float(valid["next_abs_ret"].mean())
+    low = float(valid.loc[low_entropy_mask, "next_abs_ret"].mean())
+    lift_ratio = (low / base) if base > 0 else np.nan
+
+    latest = df.dropna(
+        subset=["entropy", "sma200", "sma20", "rsi14", "prior_high20", "adv20_usd"]
+    ).iloc[-1]
+
+    today_entropy = float(latest["entropy"])
+    vol_regime_signal = bool(today_entropy < entropy_thresh)
+
+    # Direction filters
+    uptrend = bool(latest["Close"] > latest["sma200"])
+
+    # Pullback (safer): dip below SMA20 AND RSI not strong
+    pullback = bool((latest["Close"] < latest["sma20"]) and (latest["rsi14"] < 50))
+
+    # Breakout: close above prior 20-day high
+    breakout = bool(latest["Close"] > latest["prior_high20"])
+
+    # IMPORTANT: buckets use the RECENT regime gate (not just today)
+    buy_pullback = entropy_signal_recent and uptrend and pullback
+    buy_breakout = entropy_signal_recent and uptrend and breakout
+    overlap = buy_pullback and buy_breakout
+
+    if overlap:
+        bucket = "OVERLAP"
+    elif buy_pullback:
+        bucket = "PULLBACK_ONLY"
+    elif buy_breakout:
+        bucket = "BREAKOUT_ONLY"
+    else:
+        bucket = "NO_BUY"
+
+    return {
+        "symbol": symbol,
+        "last_date": str(latest.name.date()),
+
+        # entropy regime
+        "today_entropy": today_entropy,
+        "entropy_thresh": entropy_thresh,
+        "q": q,
+        "vol_regime_signal": vol_regime_signal,          # today's gate (report)
+        "entropy_signal_recent": entropy_signal_recent,  # recent gate (trade)
+        "recent_days": recent_days,
+
+        # magnitude lift stats
+        "lift_ratio": lift_ratio,
+        "low_next_abs_ret": low,
+        "base_next_abs_ret": base,
+        "obs_days": int(len(valid)),
+        "low_days": int(low_entropy_mask.sum()),
+
+        # liquidity
+        "adv20_usd": adv20,
+
+        # direction features
+        "uptrend": uptrend,
+        "pullback": pullback,
+        "breakout": breakout,
+
+        # buys + buckets
+        "buy_pullback": bool(buy_pullback),
+        "buy_breakout": bool(buy_breakout),
+        "overlap": bool(overlap),
+        "bucket": bucket,
+    }
+
+
+# -----------------------------
+# Runner
+# -----------------------------
+def run_sers(
+    tickers: list[str],
+    universe_name: str,
+    start: str = "2015-01-01",
+    window_days: int = 120,
+    q: float = 0.05,
+    recent_days: int = 3,
+    min_lift_regime: float = 1.10,
+    min_lift_buy: float = 1.40,  # strict for stocks; try 1.30 if too few buys
+    min_adv20_usd: float = 500_000_000,  # $500M ADV20
+    top_n: int = 25,
+    polite_sleep: float = 0.0,
+):
+    print(f"\nSERS Universe: {universe_name} | Tickers: {len(tickers)}")
+    print(
+        f"Params: window_days={window_days}, q={q}, recent_days={recent_days}, "
+        f"min_adv20_usd=${min_adv20_usd:,.0f}, min_lift_buy={min_lift_buy}\n"
+    )
+
+    rows = []
+    errors = []
+
+    for i, raw in enumerate(tickers, 1):
+        t = normalize_ticker(raw)
+        try:
+            r = score_symbol(
+                symbol=t,
+                start=start,
+                window_days=window_days,
+                q=q,
+                min_history_days=500,
+                min_adv20_usd=min_adv20_usd,
+                recent_days=recent_days,
+            )
+            if r is not None:
+                rows.append(r)
+        except Exception as e:
+            errors.append({"symbol": t, "error": str(e)})
+
+        if i % 25 == 0:
+            print(f"Scanned {i}/{len(tickers)} ... kept {len(rows)}")
+        if polite_sleep > 0:
+            time.sleep(polite_sleep)
+
+    out = pd.DataFrame(rows)
+    err_df = pd.DataFrame(errors)
+
+    if out.empty:
+        print("No valid results after filters. Consider lowering min_adv20_usd or widening universe.")
+        if not err_df.empty:
+            print("\n=== ERRORS ===")
+            print(err_df[["symbol", "error"]].head(50).to_string(index=False))
+        return None
+
+    pd.set_option("display.max_columns", 90)
+    pd.set_option("display.width", 220)
+
+    # 1) VOL REGIME signals today (today-only gate)
+    regime = out[out["vol_regime_signal"]].copy()
+    regime = regime[regime["lift_ratio"] >= min_lift_regime].copy()
+    regime = regime.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    print("\n=== TODAY'S ENTROPY (VOL REGIME) SIGNALS (ranked) ===")
+    if len(regime):
+        print(
+            regime[
+                [
+                    "symbol",
+                    "last_date",
+                    "vol_regime_signal",
+                    "entropy_signal_recent",
+                    "today_entropy",
+                    "entropy_thresh",
+                    "lift_ratio",
+                    "low_next_abs_ret",
+                    "base_next_abs_ret",
+                    "adv20_usd",
+                ]
+            ].to_string(index=False)
+        )
+    else:
+        print("None.")
+
+    # 2) BUY buckets (strict, using recent gate)
+    buys = out[out["lift_ratio"] >= min_lift_buy].copy()
+
+    def _print_bucket(title: str, df: pd.DataFrame):
+        print(f"\n=== {title} ===")
+        if len(df):
+            print(
+                df[
+                    [
+                        "symbol",
+                        "last_date",
+                        "bucket",
+                        "entropy_signal_recent",
+                        "today_entropy",
+                        "entropy_thresh",
+                        "lift_ratio",
+                        "adv20_usd",
+                        "uptrend",
+                        "pullback",
+                        "breakout",
+                        "low_next_abs_ret",
+                        "base_next_abs_ret",
+                    ]
+                ].to_string(index=False)
+            )
+        else:
+            print("None.")
+
+    overlap_df = buys[buys["bucket"] == "OVERLAP"].sort_values(
+        ["lift_ratio", "today_entropy"], ascending=[False, True]
+    ).head(top_n)
+
+    pullback_df = buys[buys["bucket"] == "PULLBACK_ONLY"].sort_values(
+        ["lift_ratio", "today_entropy"], ascending=[False, True]
+    ).head(top_n)
+
+    breakout_df = buys[buys["bucket"] == "BREAKOUT_ONLY"].sort_values(
+        ["lift_ratio", "today_entropy"], ascending=[False, True]
+    ).head(top_n)
+
+    _print_bucket("BUY BUCKET: OVERLAP (highest conviction)", overlap_df)
+    _print_bucket("BUY BUCKET: PULLBACK ONLY", pullback_df)
+    _print_bucket("BUY BUCKET: BREAKOUT ONLY", breakout_df)
+
+    # 3) Watchlist: RECENT regime active, no buy setup
+    watch = out[
+        (out["entropy_signal_recent"])
+        & (out["bucket"] == "NO_BUY")
+        & (out["lift_ratio"] >= min_lift_regime)
+    ].copy()
+    watch = watch.sort_values(["lift_ratio", "today_entropy"], ascending=[False, True]).head(top_n)
+
+    print("\n=== WATCHLIST: RECENT REGIME ACTIVE, NO BUY SETUP ===")
+    if len(watch):
+        print(
+            watch[
+                [
+                    "symbol",
+                    "last_date",
+                    "entropy_signal_recent",
+                    "today_entropy",
+                    "entropy_thresh",
+                    "lift_ratio",
+                    "adv20_usd",
+                    "uptrend",
+                    "pullback",
+                    "breakout",
+                ]
+            ].to_string(index=False)
+        )
+    else:
+        print("None.")
+
+    # 4) Top historical lift
+    hist = out.sort_values("lift_ratio", ascending=False).head(top_n)
+    print("\n=== TOP HISTORICAL LIFT (ranked) ===")
+    print(hist[["symbol", "lift_ratio", "low_next_abs_ret", "base_next_abs_ret", "adv20_usd"]].to_string(index=False))
+
+    if not err_df.empty:
+        print("\n=== ERRORS (first 25) ===")
+        print(err_df[["symbol", "error"]].head(25).to_string(index=False))
+
+    return out
+
+
+if __name__ == "__main__":
+    universe_name, tickers = ask_universe()
+
+    run_sers(
+        tickers=tickers,
+        universe_name=universe_name,
+        start="2015-01-01",
+        window_days=120,
+        q=0.05,
+        recent_days=3,             # <-- recent entropy window
+        min_lift_regime=1.10,
+        min_lift_buy=1.40,         # try 1.30 if buckets are too empty
+        min_adv20_usd=500_000_000, # try 200_000_000 if too restrictive
+        top_n=25,
+        polite_sleep=0.0,
+    )
