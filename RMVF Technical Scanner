@@ -1,0 +1,329 @@
+"""
+DISCLAIMER:
+This code is provided for educational and research purposes only.
+It does not constitute financial advice, investment advice,
+trading advice, or a recommendation to buy or sell any security.
+
+Agora Lycos Trading Lab makes no guarantees regarding accuracy,
+performance, or profitability. Use at your own risk.
+Past performance is not indicative of future results.
+
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from filterstemplate import ask_universe, normalize_ticker
+
+
+# -----------------------------
+# Indicator math (no pandas_ta)
+# -----------------------------
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+
+
+def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    # Wilder-style smoothing via ewm alpha=1/length
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
+    # Wilder smoothing
+    return tr.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+
+
+def rolling_vwap_daily(df: pd.DataFrame, length: int) -> pd.Series:
+    # VWAP proxy using daily candles
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    pv = tp * df["Volume"]
+    return pv.rolling(length, min_periods=length).sum() / df["Volume"].rolling(length, min_periods=length).sum()
+
+
+def crossed_up(a: pd.Series, b: float | pd.Series, lookback: int) -> bool:
+    if isinstance(b, (int, float)):
+        b1 = pd.Series(float(b), index=a.index)
+    else:
+        b1 = b.reindex(a.index)
+
+    cross = (a > b1) & (a.shift(1) <= b1.shift(1))
+    return bool(cross.tail(lookback).any())
+
+
+def compute_fibs(df: pd.DataFrame, lookback: int) -> Optional[Dict[str, float]]:
+    if len(df) < lookback:
+        return None
+    w = df.tail(lookback)
+    swing_low = float(w["Low"].min())
+    swing_high = float(w["High"].max())
+    if np.isclose(swing_low, swing_high):
+        return None
+    rng = swing_high - swing_low
+    return {
+        "low": swing_low,
+        "high": swing_high,
+        "0.500": swing_high - 0.500 * rng,
+        "0.618": swing_high - 0.618 * rng,
+    }
+
+
+def near(price: float, level: float, tol: float) -> bool:
+    return abs(price - level) / price <= tol
+
+
+def touched_and_closed_above(last: pd.Series, level: float) -> bool:
+    return (float(last["Low"]) <= level) and (float(last["Close"]) > level)
+
+
+# -----------------------------
+# Config
+# -----------------------------
+@dataclass
+class RMVFConfig:
+    period: str = "9mo"
+    interval: str = "1d"
+
+    rsi_len: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    ema_len: int = 50
+
+    fib_lookback: int = 60
+    fib_tolerance: float = 0.01
+
+    vwap_len: int = 20
+    vwap_slope_lookback: int = 5
+
+    atr_len: int = 14
+    atr_pct_min: float = 0.012
+
+    vol_len: int = 20
+    vol_mult_min: float = 1.20
+
+    cross_lookback: int = 5
+
+    # pass logic
+    min_score_to_pass: int = 5  # out of 7
+    require_ema_trend: bool = True
+
+    # rate limiting
+    request_pause_sec: float = 0.0
+
+
+def download_daily(ticker: str, cfg: RMVFConfig) -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        period=cfg.period,
+        interval=cfg.interval,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # normalize column names (yfinance usually gives capitalized already)
+    df.columns = [str(c).strip().title() for c in df.columns]
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+    return df
+
+
+def scan_ticker(ticker: str, cfg: RMVFConfig) -> Dict[str, object]:
+    t = normalize_ticker(ticker)
+    out: Dict[str, object] = {"Ticker": t}
+
+    df = download_daily(t, cfg)
+    if df.empty or len(df) < 120:
+        out["Passed"] = False
+        out["Reason"] = "insufficient_price_data"
+        return out
+
+    # Compute indicators
+    df["RSI"] = rsi(df["Close"], cfg.rsi_len)
+
+    df["MACD"], df["MACDs"], df["MACDh"] = macd(
+        df["Close"], fast=cfg.macd_fast, slow=cfg.macd_slow, signal=cfg.macd_signal
+    )
+
+    df["EMA50"] = ema(df["Close"], cfg.ema_len)
+
+    df["VWAP"] = rolling_vwap_daily(df, cfg.vwap_len)
+
+    df["ATR"] = atr(df["High"], df["Low"], df["Close"], cfg.atr_len)
+    df["ATRpct"] = df["ATR"] / df["Close"]
+
+    df["VolAvg"] = df["Volume"].rolling(cfg.vol_len, min_periods=cfg.vol_len).mean()
+
+    df = df.dropna()
+    if len(df) < cfg.fib_lookback:
+        out["Passed"] = False
+        out["Reason"] = "insufficient_post_indicator_data"
+        return out
+
+    last = df.iloc[-1]
+    close = float(last["Close"])
+
+    # -------------------------
+    # Checks (Bullish template)
+    # -------------------------
+    rsi_ok = (float(last["RSI"]) > 50.0) or crossed_up(df["RSI"], 30.0, cfg.cross_lookback)
+
+    macd_cross_ok = crossed_up(df["MACD"], df["MACDs"], cfg.cross_lookback)
+    macd_ok = macd_cross_ok and (float(last["MACDh"]) > 0.0)
+
+    ema_ok = close > float(last["EMA50"])
+
+    vwap_ok = close > float(last["VWAP"])
+    vwap_slope_ok = float(last["VWAP"]) > float(df["VWAP"].shift(cfg.vwap_slope_lookback).iloc[-1])
+    vwap_combo_ok = vwap_ok and vwap_slope_ok
+
+    atr_ok = float(last["ATRpct"]) >= cfg.atr_pct_min
+
+    vol_ok = float(last["Volume"]) >= cfg.vol_mult_min * float(last["VolAvg"])
+
+    fibs = compute_fibs(df, cfg.fib_lookback)
+    fib_ok = False
+    fib_hit = "None"
+    swing_low = np.nan
+    swing_high = np.nan
+    if fibs:
+        swing_low = fibs["low"]
+        swing_high = fibs["high"]
+        for k in ("0.500", "0.618"):
+            lvl = fibs[k]
+            if near(close, lvl, cfg.fib_tolerance) and touched_and_closed_above(last, lvl):
+                fib_ok = True
+                fib_hit = k
+                break
+
+    checks = {
+        "RSI": rsi_ok,
+        "MACD": macd_ok,
+        "FIB": fib_ok,
+        "VWAP": vwap_combo_ok,
+        "EMA50": ema_ok,
+        "ATR%": atr_ok,
+        "VOL": vol_ok,
+    }
+
+    score = int(sum(1 for v in checks.values() if v))
+    passed = score >= cfg.min_score_to_pass
+
+    if cfg.require_ema_trend and not ema_ok:
+        passed = False
+
+    out.update(
+        {
+            "Close": round(close, 4),
+            "RSI": round(float(last["RSI"]), 2),
+            "MACDh": round(float(last["MACDh"]), 6),
+            "EMA50": round(float(last["EMA50"]), 4),
+            "VWAP": round(float(last["VWAP"]), 4),
+            "ATRpct": round(float(last["ATRpct"]), 6),
+            "Vol": int(last["Volume"]),
+            "VolAvg": float(last["VolAvg"]),
+            "FibHit": fib_hit,
+            "SwingLow": round(float(swing_low), 4) if pd.notna(swing_low) else np.nan,
+            "SwingHigh": round(float(swing_high), 4) if pd.notna(swing_high) else np.nan,
+            "Score": score,
+            "Passed": bool(passed),
+            "ChecksTrue": ",".join([k for k, v in checks.items() if v]),
+            "ChecksFalse": ",".join([k for k, v in checks.items() if not v]),
+        }
+    )
+    return out
+
+
+def scan_universe(tickers: List[str], cfg: RMVFConfig) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for i, t in enumerate(tickers, 1):
+        try:
+            rows.append(scan_ticker(t, cfg))
+        except Exception as e:
+            rows.append({"Ticker": normalize_ticker(t), "Passed": False, "Reason": f"error: {e}"})
+
+        if cfg.request_pause_sec:
+            time.sleep(cfg.request_pause_sec)
+
+        if i % 25 == 0 or i == len(tickers):
+            print(f"Progress: {i}/{len(tickers)}")
+
+    df = pd.DataFrame(rows)
+    if "Score" in df.columns:
+        df = df.sort_values(["Passed", "Score", "Ticker"], ascending=[False, False, True])
+    else:
+        df = df.sort_values(["Passed", "Ticker"], ascending=[False, True])
+    return df.reset_index(drop=True)
+
+
+def main():
+    cfg = RMVFConfig()
+
+    universe_name, tickers = ask_universe()
+    tickers = [normalize_ticker(t) for t in tickers]
+    tickers = sorted(set([t for t in tickers if t]))
+
+    print("\n--- RMVF Technical Scanner (no pandas_ta) ---")
+    print(f"Universe: {universe_name}")
+    print(f"Tickers: {len(tickers)}")
+    print(f"Pass rule: score >= {cfg.min_score_to_pass} (EMA required: {cfg.require_ema_trend})\n")
+
+    results = scan_universe(tickers, cfg)
+
+    winners = results[results.get("Passed", False) == True]
+    print("\n=== WINNERS ===")
+    if winners.empty:
+        print("No winners found. Consider lowering min_score_to_pass or loosening VOL/ATR thresholds.")
+    else:
+        cols = [c for c in ["Ticker", "Close", "Score", "ChecksTrue", "ChecksFalse", "RSI", "MACDh", "EMA50", "VWAP", "ATRpct", "FibHit"] if c in winners.columns]
+        print(winners[cols].head(50).to_string(index=False))
+
+    out_file = "rmvf_technical_scan_results.csv"
+    results.to_csv(out_file, index=False)
+    print(f"\nSaved: {out_file}")
+
+
+if __name__ == "__main__":
+    main()
