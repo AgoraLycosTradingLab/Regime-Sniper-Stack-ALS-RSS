@@ -1,0 +1,541 @@
+"""
+DISCLAIMER:
+This code is provided for educational and research purposes only.
+It does not constitute financial advice, investment advice,
+trading advice, or a recommendation to buy or sell any security.
+
+Agora Lycos Trading Lab makes no guarantees regarding accuracy,
+performance, or profitability. Use at your own risk.
+Past performance is not indicative of future results.
+
+
+PIIStockScanner.py
+------------------
+Scans a selected universe and finds stocks with BUY SIGNAL
+based on the Pullback Integrity Index (PII) + hard-coded buy rule.
+
+Data source:
+- yfinance (Yahoo Finance) for daily OHLCV
+
+Universe CSVs (in same folder as this script):
+- sp500_master.csv   (recommended; filterable by CapBucket/Sector)
+- nasdaq_master.csv  (recommended; filterable by CapBucket/Sector)
+
+Fallback (if master missing):
+- sp500_companies.csv
+- nasdaq_tickers.csv
+
+Install:
+  pip install yfinance ta pandas numpy
+
+Run:
+  python PIIStockScanner.py
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import ta
+
+
+# -----------------------------
+# Config
+# -----------------------------
+ETF_TICKERS: tuple[str, ...] = (
+    "SPY",
+    "QQQ",
+    "DIA",
+    "IWM",
+    "GLD",
+    "SLV",
+    "EEM",
+    "EFA",
+    "XLC",
+    "XLY",
+    "XLP",
+    "XLE",
+    "XLF",
+    "XLV",
+    "XLRE",
+    "XLK",
+    "XLU",
+    "SMH",
+)
+
+
+@dataclass(frozen=True)
+class PIIConfig:
+    ema_fast: int = 20
+    ema_mid: int = 50
+    ema_trend: int = 200
+    rsi_window: int = 14
+    atr_window: int = 14
+    vol_sma: int = 20
+    z_lookback: int = 100
+
+    depth_max: float = 0.12
+    rsi_center: float = 47.5
+    rsi_half_width: float = 17.5
+
+    # weights must sum to 1.0
+    w_depth: float = 0.35
+    w_vol: float = 0.25
+    w_mom: float = 0.25
+    w_volp: float = 0.15
+
+
+@dataclass(frozen=True)
+class BuyRuleConfig:
+    # FILTERS
+    min_pii: float = 70.0
+    require_trend_ok: bool = True
+
+    # Prefer a real pullback (not extended, not breakdown)
+    min_depth: float = 0.01   # 1%
+    max_depth: float = 0.04   # 4%
+
+    # Avoid distribution
+    max_vol_rel: float = 1.20
+
+    # Avoid extreme noise
+    max_atr_pct: float = 0.05  # 5%
+
+    # TRIGGER: close crosses above EMA20 (hard-coded)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _clamp01(s: pd.Series) -> pd.Series:
+    return s.clip(0.0, 1.0)
+
+
+def _sigmoid(s: pd.Series) -> pd.Series:
+    s = s.clip(-60, 60)
+    return 1.0 / (1.0 + np.exp(-s))
+
+
+def _zscore(s: pd.Series, lookback: int) -> pd.Series:
+    mu = s.rolling(lookback, min_periods=lookback).mean()
+    sd = s.rolling(lookback, min_periods=lookback).std(ddof=0).replace(0, np.nan)
+    return (s - mu) / sd
+
+
+def normalize_ticker(t: str) -> str:
+    t = str(t).strip().upper()
+    if t.startswith("$"):
+        t = t[1:]
+    # Yahoo class shares: BRK.B -> BRK-B (you already fixed manually; this keeps it robust)
+    t = t.replace(".", "-")
+    return t
+
+
+def _ensure_ohlcv_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise ValueError(f"{ticker}: no data returned")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    std = {}
+    for want in ["open", "high", "low", "close", "volume"]:
+        if want in lower_map:
+            std[lower_map[want]] = want.title()
+    df = df.rename(columns=std)
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"{ticker}: missing columns {missing}. Got: {list(df.columns)}")
+
+    return df[needed].dropna()
+
+
+def fetch_yfinance(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
+    return _ensure_ohlcv_columns(df, ticker)
+
+
+# -----------------------------
+# Filtering (Cap + Sector)
+# -----------------------------
+def ask_use_filters() -> bool:
+    ans = input("Apply filters (CapBucket / Sector)? (y/n): ").strip().lower()
+    return ans in ("y", "yes")
+
+
+def ask_cap_filter() -> Optional[set[str]]:
+    print("\nMarket cap filter (CapBucket):")
+    print("  1) All")
+    print("  2) Large")
+    print("  3) Mid")
+    print("  4) Small")
+    print("  5) Micro")
+    print("  6) Large+Mid")
+    print("  7) Mid+Small")
+    choice = input("Choose 1-7: ").strip()
+
+    mapping = {
+        "1": None,
+        "2": {"Large"},
+        "3": {"Mid"},
+        "4": {"Small"},
+        "5": {"Micro"},
+        "6": {"Large", "Mid"},
+        "7": {"Mid", "Small"},
+    }
+    if choice not in mapping:
+        raise ValueError("Invalid cap filter choice.")
+    return mapping[choice]
+
+
+def ask_sector_filter(available_sectors: list[str]) -> Optional[set[str]]:
+    print("\nSector filter:")
+    print("  1) All")
+    print("  2) Choose from list")
+    choice = input("Choose 1 or 2: ").strip()
+
+    if choice == "1":
+        return None
+    if choice != "2":
+        raise ValueError("Invalid sector filter choice.")
+
+    if not available_sectors:
+        print("No sector data available in this file. Sector filter skipped.")
+        return None
+
+    print("\nAvailable sectors:")
+    for i, s in enumerate(available_sectors, 1):
+        print(f"  {i}) {s}")
+
+    raw = input("Enter sector numbers separated by commas (e.g. 1,3,7): ").strip()
+    idx = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        idx.append(int(part))
+
+    picked = {available_sectors[i - 1] for i in idx if 1 <= i <= len(available_sectors)}
+    return picked if picked else None
+
+
+def load_tickers_from_csv(path: Path) -> list[str]:
+    df = pd.read_csv(path)
+
+    if "Ticker" in df.columns:
+        series = df["Ticker"]
+    elif "Symbol" in df.columns:
+        series = df["Symbol"]
+    else:
+        series = df.iloc[:, 0]
+
+    tickers = (
+        series.astype(str)
+        .map(normalize_ticker)
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    return sorted(set(tickers))
+
+
+def load_master_with_filters(path: Path) -> list[str]:
+    df = pd.read_csv(path)
+
+    # Expect columns from the master builders; tolerate missing
+    if "Ticker" not in df.columns:
+        # fall back to first column
+        df["Ticker"] = df.iloc[:, 0]
+
+    df["Ticker"] = df["Ticker"].astype(str).map(normalize_ticker)
+    df = df.dropna(subset=["Ticker"])
+
+    if not ask_use_filters():
+        tickers = sorted(set(df["Ticker"].tolist()))
+        print(f"\nLoaded {len(tickers)} tickers (no filters)\n")
+        return tickers
+
+    cap_choice = None
+    sector_choice = None
+
+    if "CapBucket" in df.columns:
+        df["CapBucket"] = df["CapBucket"].fillna("Unknown")
+        cap_choice = ask_cap_filter()
+    else:
+        print("\nCapBucket column not found. Cap filter skipped.")
+
+    if "Sector" in df.columns:
+        df["Sector"] = df["Sector"].fillna("Unknown")
+        sectors = sorted([s for s in df["Sector"].unique().tolist() if s and s != "Unknown"])
+        sector_choice = ask_sector_filter(sectors)
+    else:
+        print("\nSector column not found. Sector filter skipped.")
+
+    if cap_choice is not None:
+        df = df[df.get("CapBucket", "Unknown").isin(cap_choice)]
+    if sector_choice is not None:
+        df = df[df.get("Sector", "Unknown").isin(sector_choice)]
+
+    tickers = sorted(set(df["Ticker"].tolist()))
+    print(f"\nFiltered universe size: {len(tickers)}\n")
+    return tickers
+
+
+# -----------------------------
+# Universe selection (NO option 3)
+# -----------------------------
+def ask_universe() -> Tuple[str, list[str]]:
+    """
+    Returns (universe_name, tickers)
+
+    Option 1: S&P 500
+      - prefers sp500_master.csv (filterable)
+      - falls back to sp500_companies.csv
+
+    Option 2: Nasdaq
+      - prefers nasdaq_master.csv (filterable)
+      - falls back to nasdaq_tickers.csv
+
+    Option 3: ETFs (predefined list)
+    """
+    print("\nSelect universe to scan:")
+    print("  1) S&P 500")
+    print("  2) Nasdaq")
+    print("  3) ETFs (predefined list)")
+    choice = input("Enter 1, 2, or 3: ").strip()
+
+    if choice == "1":
+        universe_name = "S&P 500"
+        master = Path("sp500_master.csv")
+        fallback = Path("sp500_companies.csv")
+    elif choice == "2":
+        universe_name = "Nasdaq"
+        master = Path("nasdaq_master.csv")
+        fallback = Path("nasdaq_tickers.csv")
+    elif choice == "3":
+        universe_name = "ETFs"
+        tickers = list(ETF_TICKERS)
+        print(f"\nUsing predefined ETF list ({len(tickers)} tickers).\n")
+        return universe_name, tickers
+    else:
+        raise ValueError("Invalid choice. Please enter 1, 2, or 3.")
+
+    if master.exists():
+        print(f"\nUsing master file: {master.name}")
+        tickers = load_master_with_filters(master)
+    else:
+        if not fallback.exists():
+            raise FileNotFoundError(
+                f"Missing both {master.resolve()} and {fallback.resolve()}.\n"
+                f"Create the master file (recommended) or place the fallback CSV in this folder."
+            )
+        print(f"\nMaster file not found. Using fallback list: {fallback.name} (no cap/sector filters)")
+        tickers = load_tickers_from_csv(fallback)
+        print(f"Loaded {len(tickers)} tickers.\n")
+
+    return universe_name, tickers
+
+
+# -----------------------------
+# Indicator computation
+# -----------------------------
+def compute_pii(df: pd.DataFrame, cfg: PIIConfig = PIIConfig()) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [c.lower() for c in out.columns]
+
+    close = out["close"]
+    high = out["high"]
+    low = out["low"]
+    volume = out["volume"]
+
+    out[f"ema_{cfg.ema_fast}"] = ta.trend.ema_indicator(close, window=cfg.ema_fast)
+    out[f"ema_{cfg.ema_mid}"] = ta.trend.ema_indicator(close, window=cfg.ema_mid)
+    out[f"ema_{cfg.ema_trend}"] = ta.trend.ema_indicator(close, window=cfg.ema_trend)
+
+    out[f"rsi_{cfg.rsi_window}"] = ta.momentum.rsi(close, window=cfg.rsi_window)
+    out[f"atr_{cfg.atr_window}"] = ta.volatility.average_true_range(high, low, close, window=cfg.atr_window)
+
+    out[f"vol_sma_{cfg.vol_sma}"] = volume.rolling(cfg.vol_sma, min_periods=cfg.vol_sma).mean()
+
+    ema_fast = out[f"ema_{cfg.ema_fast}"]
+    ema_mid = out[f"ema_{cfg.ema_mid}"]
+    ema_trend = out[f"ema_{cfg.ema_trend}"]
+    rsi = out[f"rsi_{cfg.rsi_window}"]
+    atr = out[f"atr_{cfg.atr_window}"]
+    vol_sma = out[f"vol_sma_{cfg.vol_sma}"]
+
+    out["trend_ok"] = (close > ema_trend).astype(float)
+
+    depth = (ema_mid - close) / close
+    depth = depth.clip(lower=0.0)
+    depth_clamped = depth.clip(upper=cfg.depth_max)
+    out["depth"] = depth
+    out["depth_score"] = _clamp01(1.0 - (depth_clamped / cfg.depth_max))
+
+    atr_pct = atr / close
+    vol_z = _zscore(atr_pct, cfg.z_lookback)
+    out["atr_pct"] = atr_pct
+    out["vol_z"] = vol_z
+    out["vol_score"] = _clamp01(_sigmoid(-vol_z))
+
+    mom_raw = 1.0 - (rsi.sub(cfg.rsi_center).abs() / cfg.rsi_half_width)
+    out["mom_score"] = _clamp01(mom_raw)
+
+    out["vol_rel"] = volume / vol_sma
+    out["volp_score"] = _clamp01(_sigmoid(-(out["vol_rel"] - 1.0)))
+
+    wsum = cfg.w_depth + cfg.w_vol + cfg.w_mom + cfg.w_volp
+    if not math.isclose(wsum, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError(f"Weights must sum to 1.0; got {wsum}")
+
+    pii_raw = out["trend_ok"] * (
+        cfg.w_depth * out["depth_score"]
+        + cfg.w_vol * out["vol_score"]
+        + cfg.w_mom * out["mom_score"]
+        + cfg.w_volp * out["volp_score"]
+    )
+    out["pii"] = (100.0 * pii_raw).clip(0.0, 100.0)
+
+    out["ema20_cross_up"] = (close > ema_fast) & (close.shift(1) <= ema_fast.shift(1))
+
+    return out
+
+
+# -----------------------------
+# BUY rule
+# -----------------------------
+def compute_buy_signal(feat: pd.DataFrame, rule: BuyRuleConfig = BuyRuleConfig()) -> pd.DataFrame:
+    out = feat.copy()
+
+    pii = out["pii"]
+    trend_ok = out["trend_ok"] == 1.0
+    depth = out["depth"]
+    atr_pct = out["atr_pct"]
+    vol_rel = out["vol_rel"]
+    trigger = out["ema20_cross_up"].fillna(False)
+
+    f_trend = trend_ok if rule.require_trend_ok else pd.Series(True, index=out.index)
+    f_pii = pii >= rule.min_pii
+    f_depth = (depth >= rule.min_depth) & (depth <= rule.max_depth)
+    f_volrel = (vol_rel <= rule.max_vol_rel) | vol_rel.isna()
+    f_atr = (atr_pct <= rule.max_atr_pct) | atr_pct.isna()
+
+    out["buy_filter_ok"] = f_trend & f_pii & f_depth & f_volrel & f_atr
+    out["buy_signal"] = out["buy_filter_ok"] & trigger
+
+    return out
+
+
+# -----------------------------
+# Scanner
+# -----------------------------
+def scan_for_buy_signals(
+    tickers: Iterable[str],
+    period: str = "2y",
+    interval: str = "1d",
+    pii_cfg: Optional[PIIConfig] = None,
+    rule_cfg: Optional[BuyRuleConfig] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    pii_cfg = pii_cfg or PIIConfig()
+    rule_cfg = rule_cfg or BuyRuleConfig()
+
+    rows = []
+    errors = []
+
+    for t in tickers:
+        try:
+            df = fetch_yfinance(t, period=period, interval=interval)
+            feat = compute_pii(df, cfg=pii_cfg)
+            feat = compute_buy_signal(feat, rule=rule_cfg)
+
+            last = feat.iloc[-1]
+            rows.append(
+                {
+                    "Ticker": t,
+                    "Date": feat.index[-1].date(),
+                    "Close": float(df["Close"].iloc[-1]),
+                    "PII": float(last["pii"]),
+                    "TrendOK": bool(last["trend_ok"] == 1.0),
+                    "Depth%": float(last["depth"]) * 100.0 if pd.notna(last["depth"]) else np.nan,
+                    "ATR%": float(last["atr_pct"]) * 100.0 if pd.notna(last["atr_pct"]) else np.nan,
+                    "VolRel": float(last["vol_rel"]) if pd.notna(last["vol_rel"]) else np.nan,
+                    "EMA20CrossUp": bool(last["ema20_cross_up"]) if pd.notna(last["ema20_cross_up"]) else False,
+                    "BuyFilterOK": bool(last["buy_filter_ok"]) if pd.notna(last["buy_filter_ok"]) else False,
+                    "BuySignal": bool(last["buy_signal"]) if pd.notna(last["buy_signal"]) else False,
+                }
+            )
+        except Exception as e:
+            errors.append({"Ticker": t, "Error": str(e)})
+
+    all_results = pd.DataFrame(rows)
+    if not all_results.empty:
+        all_results = all_results.sort_values(["BuySignal", "PII"], ascending=[False, False]).reset_index(drop=True)
+
+    buy_signals = all_results[all_results["BuySignal"]].reset_index(drop=True) if not all_results.empty else all_results
+
+    watchlist = pd.DataFrame([])
+    if not all_results.empty:
+        watchlist = all_results[
+            (all_results["TrendOK"]) & (all_results["PII"] >= 60.0)
+        ].sort_values(["PII"], ascending=[False]).reset_index(drop=True)
+
+    err_df = pd.DataFrame(errors)
+
+    return buy_signals, watchlist, err_df
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    try:
+        universe_name, tickers = ask_universe()
+
+        if len(tickers) > 1200:
+            print("Note: Large universe detected. This may take a while using per-ticker downloads.\n")
+
+        buy_df, watch_df, err_df = scan_for_buy_signals(
+            tickers,
+            period="2y",
+            interval="1d",
+        )
+
+        print(f"=== BUY SIGNALS (PII) - {universe_name} ===")
+        if buy_df.empty:
+            print("No BUY signals today.\n")
+        else:
+            print(buy_df.to_string(index=False))
+            print()
+
+        print(f"=== WATCHLIST (TrendOK=True & PII>=60) - {universe_name} (Top 25) ===")
+        if watch_df.empty:
+            print("No watchlist names.\n")
+        else:
+            print(watch_df.head(25).to_string(index=False))
+            print()
+
+        if not err_df.empty:
+            print("=== ERRORS (Skipped tickers) ===")
+            print(err_df.to_string(index=False))
+
+    except Exception as e:
+        print(f"\nError: {e}")
+
+
