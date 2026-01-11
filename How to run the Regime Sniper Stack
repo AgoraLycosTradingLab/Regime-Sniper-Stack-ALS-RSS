@@ -1,0 +1,55 @@
+
+
+run Regime Sniper Stack(ALS-RSS) in the following order:
+1. Alpha R1 Macro Indicator 
+2. Entropy Regime Scanner 
+3. Stock Entropy Regime Scanner 
+4. PII Stock Scanner 
+5. RMVF Technical Scanner
+
+1. Alpha R1 macro indicator:
+The Alpha R1 Macro Indicator output provides a daily, top-down market state snapshot. It reports:
+Regime label (Risk-On, Risk-Off, or Transition) derived from a composite risk score
+Confidence level indicating how decisive the regime signal is
+Active vs. inactive factor families to guide downstream models
+Diagnostics showing raw macro signals (equity trend, VIX level/trend, credit, rates, USD, oil) and their normalized component scores
+An optional CSV export for logging and model integration
+This output is designed to act as a macro gate for factor activation and risk sizing in the broader stack.
+
+2. Entropy Regime Scanner:
+The Entropy Regime Scanner output summarizes volatility conditions and actionable setups across the scanned ETF universe. It reports:
+Volatility regime signals identifying assets in low-entropy states, where forward price movement has historically expanded
+Regime diagnostics including today’s entropy, regime threshold, and historical lift statistics
+Bucket classification for each symbol (OVERLAP, PULLBACK_ONLY, BREAKOUT_ONLY, NO_BUY) based on trend, pullback, and breakout logic
+Ranked tables highlighting the highest-conviction buy candidates and top historical entropy regimes
+This output serves as a magnitude-based risk and opportunity filter ahead of execution layers.
+
+3. Stock Entropy Regime Scanner 
+Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
+The Stock Entropy Regime Scanner (SERS) output provides an equity-level volatility and setup map. It reports:
+Today’s entropy regime signals showing stocks currently in low-entropy (compression) states
+A recent-entropy gate (last N days) that determines whether setups remain tradable, reducing timing miss risk
+Liquidity-filtered results (ADV20 in USD) to ensure institutional tradability
+Bucket classifications (OVERLAP, PULLBACK_ONLY, BREAKOUT_ONLY, NO_BUY) used for trade selection and watchlists
+Lift statistics and diagnostics ranking stocks by historical volatility expansion following low-entropy regimes
+This output bridges regime detection and execution by narrowing the universe to liquid, regime-aligned stock setups.
+
+4. PII Stock Scanner 
+Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
+The PII Stock Scanner output delivers a clean, execution-ready signal set. It reports:
+A BUY SIGNAL table listing stocks that pass the Pullback Integrity Index threshold and all risk filters, confirmed by an EMA20 cross
+Key diagnostics per stock (PII score, trend status, pullback depth, ATR%, volume relative strength) to validate setup quality
+A ranked watchlist of trend-aligned stocks with elevated PII that have not yet triggered an entry
+An error log for symbols skipped due to data or liquidity issues
+This output is designed to surface high-integrity pullback entries while filtering out noise and late-stage extensions.
+
+
+5. RMVF Technical Scanner
+Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
+The RMVF Technical Scanner output provides a final, execution-focused validation layer. It reports:
+A pass/fail decision for each stock based on a multi-signal technical score
+A composite score (out of 7) summarizing alignment across RSI, MACD, EMA trend, VWAP slope, Fibonacci reaction, ATR expansion, and volume confirmation
+A ranked winners list showing only stocks that meet or exceed the minimum score threshold
+Detailed diagnostics indicating which technical conditions passed or failed for transparency
+A CSV export of full results for review, logging, or downstream execution
+This output acts as the final confirmation gate before trade entry.
