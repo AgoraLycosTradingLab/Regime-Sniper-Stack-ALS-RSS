@@ -22,6 +22,15 @@ What it does (EOD, daily data):
    - BREAKOUT_ONLY
    - NO_BUY (may still be a VOL REGIME signal)
 
+| Bucket                       | Typical Hold            |
+| ---------------------------- | ----------------------- |
+| **OVERLAP**                  | 1–5 trading days        |
+| **BREAKOUT_ONLY**            | 3–10 trading days       |
+| **PULLBACK_ONLY**            | 2–7 trading days        |
+| **Vol-regime only (NO_BUY)** | Observation / prep only |
+
+
+
 Run:
   python entropy_bucket_scanner.py
 """
