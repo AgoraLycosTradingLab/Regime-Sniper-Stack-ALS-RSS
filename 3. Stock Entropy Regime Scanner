@@ -23,6 +23,14 @@ SERS = Stock version of ERS with:
     - vol_regime_signal = entropy low TODAY (for reporting)
     - entropy_signal_recent = entropy low at any point in last N days (for trading buckets)
 
+| Bucket                        | Intended Hold |
+| ----------------------------- | ------------- |
+| **OVERLAP**                   | ~3–7 days     |
+| **BREAKOUT_ONLY**             | ~5–15 days    |
+| **PULLBACK_ONLY**             | ~3–10 days    |
+| **WATCHLIST (recent regime)** | Monitor only  |
+
+
 Run:
   python Stock_Entropy_Regime_Scanner_SERS.py
 
