@@ -24,6 +24,14 @@ Bucket classification for each symbol (OVERLAP, PULLBACK_ONLY, BREAKOUT_ONLY, NO
 Ranked tables highlighting the highest-conviction buy candidates and top historical entropy regimes
 This output serves as a magnitude-based risk and opportunity filter ahead of execution layers.
 
+| Bucket                       | Typical Hold            |
+| ---------------------------- | ----------------------- |
+| **OVERLAP**                  | 1–5 trading days        |
+| **BREAKOUT_ONLY**            | 3–10 trading days       |
+| **PULLBACK_ONLY**            | 2–7 trading days        |
+| **Vol-regime only (NO_BUY)** | Observation / prep only |
+
+
 3. Stock Entropy Regime Scanner 
 Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
 The Stock Entropy Regime Scanner (SERS) output provides an equity-level volatility and setup map. It reports:
@@ -33,6 +41,14 @@ Liquidity-filtered results (ADV20 in USD) to ensure institutional tradability
 Bucket classifications (OVERLAP, PULLBACK_ONLY, BREAKOUT_ONLY, NO_BUY) used for trade selection and watchlists
 Lift statistics and diagnostics ranking stocks by historical volatility expansion following low-entropy regimes
 This output bridges regime detection and execution by narrowing the universe to liquid, regime-aligned stock setups.
+
+| Bucket                        | Intended Hold |
+| ----------------------------- | ------------- |
+| **OVERLAP**                   | ~3–7 days     |
+| **BREAKOUT_ONLY**             | ~5–15 days    |
+| **PULLBACK_ONLY**             | ~3–10 days    |
+| **WATCHLIST (recent regime)** | Monitor only  |
+
 
 4. PII Stock Scanner 
 Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
