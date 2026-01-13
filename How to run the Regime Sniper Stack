@@ -59,6 +59,16 @@ A ranked watchlist of trend-aligned stocks with elevated PII that have not yet t
 An error log for symbols skipped due to data or liquidity issues
 This output is designed to surface high-integrity pullback entries while filtering out noise and late-stage extensions.
 
+PII Holding Window (Operational Reality)
+Primary window
+3–7 trading days
+This is where PII has its highest expectancy
+Upper bound (if everything goes right)
+10–15 trading days
+Only when momentum expands immediately after entry
+Failure window
+1–3 days
+If price stalls or rolls over, the signal has already failed
 
 5. RMVF Technical Scanner
 Select the universe SP500, Nasdaq, or ETFs.  Select Marketcap and Sector filters
